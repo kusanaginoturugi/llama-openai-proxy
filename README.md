@@ -25,6 +25,15 @@
 ruby ~/.local/bin/llama-openai-proxy.rb
 ```
 
+ログを原文と訳文だけに絞る:
+
+```sh
+ruby ~/.local/bin/llama-openai-proxy.rb --brief
+ruby ~/.local/bin/llama-openai-proxy.rb -b
+```
+
+TTY では `モデル`、`ソース`、`訳文` に色が付く。
+
 ## Generate glossary
 
 SkyrimSE english -> japanese:
@@ -51,6 +60,31 @@ Dread Gargoyle	ドレッド・ガーゴイル
 
 完全一致した行は LLM に投げず、この訳を直接返す。
 
+## Proxy behavior
+
+プロキシは xTranslator から来た本文をそのまま llama.cpp に流さない。
+
+- xTranslator の `OpenAI_Query` 部分は翻訳対象から外し、原文だけを `Source text` として渡す。
+- 用語集に完全一致した行は llama.cpp に投げず、辞書訳を直接返す。
+- 複数行リクエストでは、全行が辞書で解決できた場合だけ直接返す。1行でも未解決ならリクエスト全体を llama.cpp に回す。
+- `Spell Tome: <辞書にある呪文名>` は例外的に `呪文の書: <呪文名の訳>` として直接返す。
+- 2行以下かつ空白抜き160文字以下の短文は `translategemma-4B`、それ以外は `translategemma-12B` に自動で振り分ける。
+- llama.cpp に回す場合も、用語集ヒットの有無に関係なく、プロキシ側で英語の出力制約プロンプトを注入する。
+- 用語集ヒットがある場合は、最大 `XTRANSLATOR_GLOSSARY_LIMIT` 件までプロンプトに TSV 形式で添付する。
+- 応答後処理で、Markdown コードフェンス、箇条書き、番号、太字、引用符風の装飾、余計な `<tags>` を削る。
+- 1行入力に対して複数行出力が返った場合は、空行を捨てて1行へ結合する。
+- 原文行末に `.` / `。` がない場合、訳文行末に追加された `.` / `。` は削る。
+- xTranslator が先に接続を閉じた場合の `EPIPE` / `ECONNRESET` は通常の切断として扱い、プロキシは落とさない。
+
+短文モデルの振り分けは環境変数で変えられる。
+
+```sh
+XTRANSLATOR_SHORT_MODEL=translategemma-4B
+XTRANSLATOR_LONG_MODEL=translategemma-12B
+XTRANSLATOR_SHORT_MODEL_MAX_LINES=2
+XTRANSLATOR_SHORT_MODEL_MAX_CHARS=160
+```
+
 ## xTranslator API settings
 
 OpenAI API tab:
@@ -59,14 +93,14 @@ OpenAI API tab:
 OpenAI_Key=no-key
 OpenAI_URL=http://127.0.0.1:18080/v1/chat/completions
 OpenAI_Model=translategemma-12B
-OpenAI_Query=Translate the following text from the video game Skyrim to %lang_dest%. Preserve the exact text structure, line breaks, <tags>, placeholders, proper names, and numbers. Use natural fantasy RPG / Skyrim terminology. Do not add explanations, notes, quotes, Markdown, or extra lines. Output only the translated text:
+OpenAI_Query=Translate to %lang_dest%. Output only the translated text:
 ```
 
 Quality-first array settings are in `Misc/ApiTranslator.txt`, not `UserPrefs/commonApiPrefs.ini`.
 
 ```txt
-OpenAI_CharLimit=1000
-OpenAI_ArrayLimit=1
+OpenAI_CharLimit=2000
+OpenAI_ArrayLimit=2
 OpenAI_ArrayTimePause=0
 ```
 
