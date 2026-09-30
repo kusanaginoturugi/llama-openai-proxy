@@ -99,6 +99,18 @@ xTranslator は応答を約 20 秒しか待たない（設定項目なし）。�
 - 手動で今すぐ更新: `systemctl --user start llama-openai-proxy-dict`
 - 手動で直したい訳は `xtranslator-glossary.local.tsv` に `原文<TAB>訳文` で書く（これも自動で読み直す）
 
+### 作業中辞書（session）
+
+SST を保存するのは mod を訳し終えてからが多いので、それまでの訳をプロキシ自身が貯めて使い回す。
+
+- 検証を通った LLM の訳を 1 行ずつ `~/.local/share/llama-openai-proxy/session.jsonl` に追記する
+- 優先度は 手動 TSV ＞ スナップショット ＞ 作業中辞書。完全一致・用語・類似例文のすべてに使う
+  - mod 固有の NPC 名やアイテム名を一度訳すと、以降の文ではその訳を用語として強制する
+  - 類似例文 3 件のうち最大 2 件を作業中辞書から優先して選ぶ（`XTRANSLATOR_SESSION_EXAMPLE_LIMIT`）
+- SST を保存してスナップショットの**中身が変わったら**空にする（訳は SST 側に入ったとみなす）。再起動による同じ内容の書き出し直しでは消さない
+- 手動で捨てる: `command rm -f ~/.local/share/llama-openai-proxy/session.jsonl`（次のリクエストでプロキシが気づく）
+- xTranslator 上で手直しした訳は、SST を保存するまでプロキシには見えない
+
 ## Try
 
 ```sh
@@ -122,6 +134,8 @@ scripts/try.sh 8091 < scripts/samples.txt
 | `XTRANSLATOR_CACHE` | `~/.cache/llama-openai-proxy/translations.jsonl` | 空文字で無効 |
 | `XTRANSLATOR_WARMUP` | `1` | `0` で起動時ロードしない |
 | `XTRANSLATOR_DICTIONARY` | `~/.local/share/llama-openai-proxy/dictionary.jsonl` | 辞書スナップショット |
+| `XTRANSLATOR_SESSION` | `~/.local/share/llama-openai-proxy/session.jsonl` | 作業中辞書。空文字で無効 |
+| `XTRANSLATOR_SESSION_EXAMPLE_LIMIT` | `2` | 類似例文のうち作業中辞書から優先して入れる件数 |
 | `XTRANSLATOR_GLOSSARY_PREPEND` | リポジトリ内 `xtranslator-glossary.local.tsv` | `:` 区切りで複数可 |
 
 ## Reload

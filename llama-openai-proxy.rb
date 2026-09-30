@@ -29,16 +29,19 @@ CLIENT_BUDGET = env("CLIENT_BUDGET", "18").to_f
 WARMUP = env("WARMUP", "1") != "0"
 
 DICTIONARY_PATH = File.expand_path(env("DICTIONARY", "~/.local/share/llama-openai-proxy/dictionary.jsonl"))
+SESSION_PATH = env("SESSION", File.expand_path("~/.local/share/llama-openai-proxy/session.jsonl"))
 GAME_TITLE = env("GAME_TITLE", "The Elder Scrolls V: Skyrim")
 GLOSSARY_PREPEND = env("GLOSSARY_PREPEND", File.join(__dir__, "xtranslator-glossary.local.tsv"))
 GLOSSARY_LIMIT = env("GLOSSARY_LIMIT", "40").to_i
 EXAMPLE_LIMIT = env("EXAMPLE_LIMIT", "3").to_i
+SESSION_EXAMPLE_LIMIT = env("SESSION_EXAMPLE_LIMIT", "2").to_i
 CACHE_PATH = env("CACHE", File.expand_path("~/.cache/llama-openai-proxy/translations.jsonl"))
 PROMPT_VERSION = "3"
 
 DICTIONARY = Dictionary.new(
   snapshot: DICTIONARY_PATH,
-  local_paths: GLOSSARY_PREPEND.split(":").map { |path| File.expand_path(path) }
+  local_paths: GLOSSARY_PREPEND.split(":").map { |path| File.expand_path(path) },
+  session: SESSION_PATH.empty? ? nil : File.expand_path(SESSION_PATH)
 )
 
 # ---- xTranslator request ----
@@ -135,7 +138,7 @@ def build_prompt(text, terms, examples, problems = [])
   end
 
   unless examples.empty?
-    sections << "Reference translations from the official Japanese localization:\n" +
+    sections << "Reference translations of similar lines (official localization and earlier translations). Follow their wording:\n" +
                 examples.map { |s, t| "English: #{s}\nJapanese: #{t}" }.join("\n\n")
   end
 
@@ -282,7 +285,7 @@ end
 # 戻り値: [訳文, 残った問題]
 def translate_with_llm(model, text)
   terms = DICTIONARY.match_terms(text, limit: GLOSSARY_LIMIT)
-  examples = DICTIONARY.similar_examples(text, limit: EXAMPLE_LIMIT)
+  examples = DICTIONARY.similar_examples(text, limit: EXAMPLE_LIMIT, session_limit: SESSION_EXAMPLE_LIMIT)
   max_tokens = (text.length * 3).clamp(64, 8192)
   best = nil
   problems = []
@@ -313,6 +316,15 @@ def translate_with_llm(model, text)
   best
 end
 
+# 検証を通った訳を 1 行ずつ作業中辞書へ。以降の用語・例文・完全一致に使われる。
+def remember_lines(text, output)
+  sources = text.split("\n", -1)
+  targets = output.split("\n", -1)
+  return unless sources.length == targets.length
+
+  sources.zip(targets).each { |source, target| DICTIONARY.remember(source, target) }
+end
+
 # 1 リクエスト分を訳す。戻り値: [訳文, ログ用ラベル]
 def translate(source_text)
   DICTIONARY.refresh!
@@ -337,6 +349,7 @@ def translate(source_text)
     # temperature 0 なので再実行しても同じ結果。問題が残っても保存し、xTranslator が
     # timeout で切った長文も次のリクエストで即返せるようにする
     CACHE.store(model, text, output)
+    remember_lines(text, output) if problems.empty?
     label = problems.empty? ? model : "#{model} (#{problems.length} problems)"
   end
 
@@ -441,7 +454,7 @@ end
 server = TCPServer.new(LISTEN_HOST, LISTEN_PORT)
 warn "listening on http://#{LISTEN_HOST}:#{LISTEN_PORT}/v1/chat/completions"
 warn "upstream #{UPSTREAM} model=#{MODEL}#{SHORT_MODEL.empty? ? '' : " short=#{SHORT_MODEL}"}"
-warn "dictionary #{DICTIONARY_PATH} memory=#{DICTIONARY.memory_size} terms=#{DICTIONARY.term_size} examples=#{DICTIONARY.example_size} cache=#{CACHE.size}"
+warn "dictionary #{DICTIONARY_PATH} memory=#{DICTIONARY.memory_size} terms=#{DICTIONARY.term_size} examples=#{DICTIONARY.example_size} session=#{DICTIONARY.session_size} cache=#{CACHE.size}"
 warn "dump requests to #{DUMP_PATH}" unless DUMP_PATH.to_s.empty?
 
 trap("INT") do

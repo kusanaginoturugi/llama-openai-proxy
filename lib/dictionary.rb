@@ -1,11 +1,15 @@
 # frozen_string_literal: true
 
+require "digest"
 require "json"
 require "set"
 
 # 辞書スナップショット (JSONL) と手動 TSV から、翻訳メモリ・用語集・類似例文を引く。
 # スナップショットは xtranslator_sst_glossary.rb --format jsonl が SST から書き出す。
 # 元ファイルの mtime が変わったら refresh! で作り直す。
+#
+# 作業中辞書 (session): プロキシ自身の訳を 1 行ずつ貯め、優先度最低の層として使う。
+# SST が保存されてスナップショットの中身が変わったら空にする（訳は SST 側に入ったとみなす）。
 class Dictionary
   WORD_RE = /[[:alnum:]]+(?:['’][[:alnum:]]+)*/
   STOPWORDS = %w[
@@ -20,11 +24,12 @@ class Dictionary
   EXAMPLE_MAX_CHARS = 300
   EXAMPLE_MAX_DF = 400
 
-  attr_reader :memory_size, :term_size, :example_size
+  attr_reader :memory_size, :term_size, :example_size, :session_size
 
-  def initialize(snapshot:, local_paths: [])
+  def initialize(snapshot:, local_paths: [], session: nil)
     @snapshot = snapshot
     @local_paths = local_paths
+    @session = session.to_s.empty? ? nil : session
     @signature = nil
     refresh!
   end
@@ -44,13 +49,30 @@ class Dictionary
   end
 
   # 元ファイルに変化があれば読み直す。読み直したら true。
+  # 作業中辞書のファイルが外から消された場合も読み直す。
   def refresh!
     signature = paths.map { |path| [path, File.mtime(path).to_f, File.size(path)] }
-    return false if signature == @signature
+    session_removed = @session && @session_size.to_i.positive? && !File.file?(@session)
+    return false if signature == @signature && !session_removed
 
     warn "dictionary: snapshot not found: #{@snapshot}" unless File.file?(@snapshot)
     build(signature.map(&:first))
+    reset_session_if_snapshot_changed
+    load_session
     @signature = signature
+    true
+  end
+
+  # プロキシの訳を作業中辞書に追加する。既に辞書にある原文は無視。追加したら true。
+  def remember(source, target)
+    return false unless @session
+    return false if source.strip.empty? || target.strip.empty? || source == target
+    return false unless target.match?(/[\p{Hiragana}\p{Katakana}\p{Han}]/)
+    return false if @memory.key?(source)
+
+    add(source, target, false, session: true)
+    File.open(@session, "a") { |f| f.puts JSON.dump(source: source, target: target) }
+    @session_size += 1
     true
   end
 
@@ -106,7 +128,9 @@ class Dictionary
   end
 
   # 原文と珍しい単語を多く共有する既訳を返す。文体と固有名詞の訳し方を揃える用。
-  def similar_examples(text, limit: 3, min_score: 6.0)
+  # 作業中辞書の例文は session_limit 件まで優先して入れる（同じ mod の直前の訳が一番近いため）。
+  # 並びは 公式訳 → 作業中辞書（原文に近い位置）。
+  def similar_examples(text, limit: 3, session_limit: 2, min_score: 6.0)
     return [] if limit <= 0
 
     query = Dictionary.words(Dictionary.mask_tags(text)).reject { |w| w.length < 3 || STOPWORDS.include?(w) }.uniq
@@ -120,13 +144,16 @@ class Dictionary
     end
 
     text_key = text.to_s.strip.downcase
-    scores
-      .map { |id, score| [id, score / Math.sqrt(@example_lengths[id])] }
-      .select { |_, score| score >= min_score / Math.sqrt(query.length.clamp(1, 16)) }
-      .sort_by { |id, score| [-score, id] }
-      .map { |id, _| @examples[id] }
-      .reject { |source, _| source.strip.downcase == text_key }
-      .first(limit)
+    ranked = scores
+             .map { |id, score| [id, score / Math.sqrt(@example_lengths[id])] }
+             .select { |_, score| score >= min_score / Math.sqrt(query.length.clamp(1, 16)) }
+             .sort_by { |id, score| [-score, id] }
+             .map(&:first)
+             .reject { |id| @examples[id][0].strip.downcase == text_key }
+
+    session = ranked.select { |id| @session_ids.include?(id) }.first([session_limit, limit].min)
+    official = (ranked - session).first(limit - session.length)
+    (official + session).map { |id| @examples[id] }
   end
 
   private
@@ -145,7 +172,10 @@ class Dictionary
     @terms = {}
     @examples = []
     @example_lengths = []
-    @postings = Hash.new { |h, k| h[k] = [] }
+    @postings = {}
+    @session_ids = Set.new
+    @session_size = 0
+    @max_term_words = 1
 
     paths.each do |path|
       local = path != @snapshot
@@ -154,11 +184,40 @@ class Dictionary
       warn "dictionary: skip #{path}: #{e.message}"
     end
 
-    @postings.default_proc = nil
-    @max_term_words = @terms.keys.map { |k| k.count(" ") + 1 }.max || 1
     @memory_size = @memory.size
     @term_size = @terms.size
     @example_size = @examples.size
+  end
+
+  # スナップショットの中身が前回と違えば作業中辞書を空にする。
+  # 中身のハッシュを "<session>.snapshot" に覚えておく（再起動時の書き出し直しでは消さない）。
+  def reset_session_if_snapshot_changed
+    return unless @session && File.file?(@snapshot)
+
+    digest_path = "#{@session}.snapshot"
+    digest = Digest::SHA256.file(@snapshot).hexdigest
+    previous = File.read(digest_path).strip if File.file?(digest_path)
+
+    if previous && previous != digest && File.file?(@session)
+      File.delete(@session)
+      warn "dictionary: session cleared (snapshot changed)"
+    end
+    File.write(digest_path, digest) unless previous == digest
+  end
+
+  def load_session
+    return unless @session && File.file?(@session)
+
+    File.foreach(@session, chomp: true, encoding: "utf-8") do |line|
+      row = JSON.parse(line)
+      source = row["source"].to_s
+      next if @memory.key?(source)
+
+      add(source, row["target"].to_s, false, session: true)
+      @session_size += 1
+    rescue JSON::ParserError
+      next
+    end
   end
 
   def each_pair(path)
@@ -178,14 +237,14 @@ class Dictionary
     end
   end
 
-  def add(source, target, local)
+  def add(source, target, local, session: false)
     return if source.empty? || target.empty? || target == "-" || source == target
 
     first = !@memory.key?(source)
     @memory[source] ||= target
     @memory_ci[source.downcase] ||= target
     add_term(source, target, local) if local || term_like?(source)
-    add_example(source, target) if first && example_like?(source, target)
+    add_example(source, target, session) if first && example_like?(source, target)
   end
 
   def add_term(source, target, local)
@@ -194,16 +253,18 @@ class Dictionary
 
     words = source.tr("’", "'").scan(WORD_RE)
     @terms[key] ||= { source: source, target: target, local: local, words: words }
+    @max_term_words = [@max_term_words, words.length].max
   end
 
-  def add_example(source, target)
+  def add_example(source, target, session)
     id = @examples.length
     words = Dictionary.words(source).reject { |w| w.length < 3 || STOPWORDS.include?(w) }.uniq
     return if words.length < 3
 
     @examples << [source, target]
     @example_lengths << words.length
-    words.each { |word| @postings[word] << id }
+    @session_ids << id if session
+    words.each { |word| (@postings[word] ||= []) << id }
   end
 
   # 旧 xtranslator_sst_glossary.rb の usable_entry? と同じ基準。
