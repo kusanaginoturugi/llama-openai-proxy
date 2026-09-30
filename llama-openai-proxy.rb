@@ -24,6 +24,8 @@ SHORT_MODEL_MAX_CHARS = env("SHORT_MODEL_MAX_CHARS", "160").to_i
 TEMPERATURE = env("TEMPERATURE", "0").to_f
 UPSTREAM_TIMEOUT = env("UPSTREAM_TIMEOUT", "30").to_f
 RETRIES = env("RETRIES", "1").to_i
+# xTranslator (Delphi REST) は約 20 秒で接続を切る。この秒数に収まりそうなときだけ再試行する
+CLIENT_BUDGET = env("CLIENT_BUDGET", "18").to_f
 WARMUP = env("WARMUP", "1") != "0"
 
 XT_ROOT = File.expand_path(env("ROOT", "~/.local/bin/_xTranslator"))
@@ -35,7 +37,7 @@ GLOSSARY_PREPEND = env("GLOSSARY_PREPEND", File.join(__dir__, "xtranslator-gloss
 GLOSSARY_LIMIT = env("GLOSSARY_LIMIT", "40").to_i
 EXAMPLE_LIMIT = env("EXAMPLE_LIMIT", "3").to_i
 CACHE_PATH = env("CACHE", File.expand_path("~/.cache/llama-openai-proxy/translations.jsonl"))
-PROMPT_VERSION = "2"
+PROMPT_VERSION = "3"
 
 DICTIONARY = Dictionary.new(
   root: XT_ROOT, game: GAME, source: SOURCE_LANG, dest: DEST_LANG,
@@ -287,6 +289,7 @@ def translate_with_llm(model, text)
   max_tokens = (text.length * 3).clamp(64, 8192)
   best = nil
   problems = []
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
   (RETRIES + 1).times do |attempt|
     prompt = build_prompt(text, terms, examples, problems)
@@ -302,6 +305,12 @@ def translate_with_llm(model, text)
 
     best = [output, problems] if best.nil? || problems.length < best[1].length
     break if problems.empty?
+
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    if elapsed * (attempt + 2) / (attempt + 1) > CLIENT_BUDGET
+      log_verbose("skip retry: #{elapsed.round(1)}s elapsed, budget #{CLIENT_BUDGET}s")
+      break
+    end
   end
 
   best
@@ -328,7 +337,9 @@ def translate(source_text)
     label = "cache"
   else
     output, problems = translate_with_llm(model, text)
-    CACHE.store(model, text, output) if problems.empty?
+    # temperature 0 なので再実行しても同じ結果。問題が残っても保存し、xTranslator が
+    # timeout で切った長文も次のリクエストで即返せるようにする
+    CACHE.store(model, text, output)
     label = problems.empty? ? model : "#{model} (#{problems.length} problems)"
   end
 

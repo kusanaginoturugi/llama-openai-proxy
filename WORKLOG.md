@@ -35,9 +35,15 @@ Record（xTranslator 実機確認）:
 - 長文向け: `max_tokens` の上限を 8192 にし、read timeout を `UPSTREAM_TIMEOUT + max_tokens/25` 秒に。約 3100 文字の本で 35 秒（再試行 1 回を含む）。
 - 用語照合と例文検索で `<img src=...>` などのタグの中を無視するようにした（`Books` → `本` の誤検出）。
 
+- 長文が「21 秒で終わるのに反映されない」: xTranslator が約 20 秒で切断していた（`EPIPE`）。1 回 17 秒のところを、用語の誤検出（`an Imperial sword` → `Imperial Sword = 帝国軍の剣`）でリトライして 34 秒かかっていた。
+  - 2 語以上の用語は、2 語目以降の大文字小文字が一致したときだけ採用するようにした。
+  - 再試行は `XTRANSLATOR_CLIENT_BUDGET`（18 秒）に収まりそうなときだけにした。
+  - 問題が残った訳もキャッシュするようにした（temperature 0 なので再実行しても同じ）。切断された長文も、再翻訳で即座に返る。
+  - 同じ日記（2702 文字）: 1 回目 16.5 秒（問題なし）、2 回目はキャッシュから 0 秒。
+
 Handoff:
 
-- 未確認: `CharLimit=6000` にした後、長文を含めて xTranslator から通しで訳せるか。
+- 約 2700 文字を超える文は、1 回目は xTranslator の timeout に間に合わない。再翻訳すればキャッシュから返る。根本的に直すなら、応答を chunked で少しずつ送って接続を保つ方法がある（Delphi 側で効くかは未検証）。
 - 未検証: `prefs_vocab_*.ini` の `|1` が「無効」を意味するという前提（旧実装からの引き継ぎ）。
 - `~/.local/bin/llama-openai-proxy.rb` はリポジトリへの symlink にした（7/13 の古い版は置き換え済み）。
 - 今後の候補: 類似例文の選び方を embedding（`embeddinggemma-300M` が router にある）に置き換える。キャッシュのキーに辞書の版を含める。

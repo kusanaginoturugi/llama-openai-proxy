@@ -60,6 +60,9 @@ OpenAI_ArrayTimePause=0
 
 `OpenAI_CharLimit` を超える文字列は xTranslator が送る前に捨てる（「API の文字数上限を越えているため一部の文字列は無視されます」）。
 
+xTranslator は応答を約 20 秒しか待たない（設定項目なし）。約 2700 文字の本で 16 秒程度なので、それより長い文は 1 回目は切断されて訳が反映されない。
+プロキシは切断後も訳を最後まで作ってキャッシュするので、**もう一度同じ文を翻訳すれば即座に反映される**。
+
 ## Dictionary
 
 - `~/.local/bin/_xTranslator/UserDictionaries/SkyrimSE/*_english_japanese.sst` を全部読む
@@ -84,6 +87,7 @@ scripts/try.sh 8091 < scripts/samples.txt
 | `XTRANSLATOR_TEMPERATURE` | `0` | |
 | `XTRANSLATOR_UPSTREAM_TIMEOUT` | `30` | 秒。read timeout は `これ + max_tokens/25` 秒。超えたら原文をそのまま返す |
 | `XTRANSLATOR_RETRIES` | `1` | 検証 NG 時の再試行回数 |
+| `XTRANSLATOR_CLIENT_BUDGET` | `18` | 秒。再試行してもこの時間に収まりそうなときだけ再試行する（xTranslator は約 20 秒で切断する） |
 | `XTRANSLATOR_GLOSSARY_LIMIT` | `40` | プロンプトに入れる用語の上限 |
 | `XTRANSLATOR_EXAMPLE_LIMIT` | `3` | プロンプトに入れる類似例文の数（0 で無効） |
 | `XTRANSLATOR_CACHE` | `~/.cache/llama-openai-proxy/translations.jsonl` | 空文字で無効 |

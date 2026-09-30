@@ -88,6 +88,8 @@ class Dictionary
         entry = @terms[lowered[i, n].join(" ")]
         next unless entry
         next if n == 1 && !entry[:local] && !proper_noun?(text, tokens[i], entry[:target])
+        # 2 語目以降は大文字小文字まで一致したときだけ（"an Imperial sword" を "Imperial Sword" にしない）
+        next if n > 1 && !entry[:local] && tokens[i + 1, n - 1].map(&:first) != entry[:words].drop(1)
 
         hit = [entry, n]
         break
@@ -185,7 +187,8 @@ class Dictionary
     key = Dictionary.term_key(source)
     return if key.empty? || key.count(" ") >= TERM_MAX_WORDS
 
-    @terms[key] ||= { source: source, target: target, local: local }
+    words = source.tr("’", "'").scan(WORD_RE)
+    @terms[key] ||= { source: source, target: target, local: local, words: words }
   end
 
   def add_example(source, target)
