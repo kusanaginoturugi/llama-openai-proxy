@@ -48,6 +48,18 @@ OpenAI_Key=no-key
 `OpenAI_Model` と `OpenAI_Query` はプロキシが差し替えるので何でもいい。
 ただしプロキシは「user メッセージの 1 行目 = クエリ、2 行目以降 = 原文」として扱うので、`OpenAI_Query` は 1 行にする。
 
+`commonApiPrefs.ini` は xTranslator の終了時に上書きされるので、必ず閉じてから編集する（GUI からは URL を変えられない）。
+
+`Misc/ApiTranslator.txt`（xTranslator は書き戻さない。変更後は xTranslator 再起動）:
+
+```txt
+OpenAI_CharLimit=6000
+OpenAI_ArrayLimit=2
+OpenAI_ArrayTimePause=0
+```
+
+`OpenAI_CharLimit` を超える文字列は xTranslator が送る前に捨てる（「API の文字数上限を越えているため一部の文字列は無視されます」）。
+
 ## Dictionary
 
 - `~/.local/bin/_xTranslator/UserDictionaries/SkyrimSE/*_english_japanese.sst` を全部読む
@@ -70,7 +82,7 @@ scripts/try.sh 8091 < scripts/samples.txt
 | `XTRANSLATOR_MODEL` | `gemma-4-12b-it-qat-imatrix` | router の model ID（`/etc/llama.cpp/models.ini` のセクション名） |
 | `XTRANSLATOR_SHORT_MODEL` | 空 | 設定すると短文だけこのモデルへ。`--models-max 1` だと載せ替えが頻発するので非推奨 |
 | `XTRANSLATOR_TEMPERATURE` | `0` | |
-| `XTRANSLATOR_UPSTREAM_TIMEOUT` | `30` | 秒。超えたら原文をそのまま返す |
+| `XTRANSLATOR_UPSTREAM_TIMEOUT` | `30` | 秒。read timeout は `これ + max_tokens/25` 秒。超えたら原文をそのまま返す |
 | `XTRANSLATOR_RETRIES` | `1` | 検証 NG 時の再試行回数 |
 | `XTRANSLATOR_GLOSSARY_LIMIT` | `40` | プロンプトに入れる用語の上限 |
 | `XTRANSLATOR_EXAMPLE_LIMIT` | `3` | プロンプトに入れる類似例文の数（0 で無効） |

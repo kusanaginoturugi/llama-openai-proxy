@@ -37,6 +37,9 @@ class Dictionary
 
   def self.term_key(text) = words(text).join(" ")
 
+  # <img src=...> や <font ...> の中身を照合対象から外す（位置は保つ）。
+  def self.mask_tags(text) = text.to_s.gsub(/<[^<>]*>/) { |tag| " " * tag.length }
+
   def paths
     @local_paths.select { |path| File.file?(path) } +
       SST.files(root: @root, game: @game, source: @source, dest: @dest)
@@ -72,7 +75,7 @@ class Dictionary
   # 1 語の用語は、原文側で大文字始まりで、かつ 文中にある か 訳がカタカナを含む（固有名詞の音訳）ときだけ採用する。
   # "Speak = 話す" のような文頭の一般語を拾わないため。
   def match_terms(text, limit: 40)
-    text = text.to_s.tr("’", "'")
+    text = Dictionary.mask_tags(text).tr("’", "'")
     tokens = []
     text.scan(WORD_RE) { tokens << [Regexp.last_match[0], Regexp.last_match.begin(0)] }
     lowered = tokens.map { |word, _| word.downcase }
@@ -105,7 +108,7 @@ class Dictionary
   def similar_examples(text, limit: 3, min_score: 6.0)
     return [] if limit <= 0
 
-    query = Dictionary.words(text).reject { |w| w.length < 3 || STOPWORDS.include?(w) }.uniq
+    query = Dictionary.words(Dictionary.mask_tags(text)).reject { |w| w.length < 3 || STOPWORDS.include?(w) }.uniq
     scores = Hash.new(0.0)
     query.each do |word|
       ids = @postings[word]

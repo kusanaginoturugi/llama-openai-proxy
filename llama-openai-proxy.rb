@@ -270,8 +270,9 @@ def upstream_chat(model, prompt, max_tokens)
 
   Net::HTTP.start(UPSTREAM.host, UPSTREAM.port) do |http|
     if UPSTREAM_TIMEOUT.positive?
+      # 長文は生成に時間がかかるので、最悪 25 tok/s として read timeout を延ばす
       http.open_timeout = UPSTREAM_TIMEOUT
-      http.read_timeout = UPSTREAM_TIMEOUT
+      http.read_timeout = UPSTREAM_TIMEOUT + max_tokens / 25.0
     end
 
     http.request(post)
@@ -283,7 +284,7 @@ end
 def translate_with_llm(model, text)
   terms = DICTIONARY.match_terms(text, limit: GLOSSARY_LIMIT)
   examples = DICTIONARY.similar_examples(text, limit: EXAMPLE_LIMIT)
-  max_tokens = (text.length * 3).clamp(64, 4096)
+  max_tokens = (text.length * 3).clamp(64, 8192)
   best = nil
   problems = []
 
@@ -451,21 +452,25 @@ loop do
     user_message = user_message_from(JSON.parse(body))
     raise "no user message in request" unless user_message
 
-    source_text = source_text_from(user_message["content"])
+    # xTranslator は配列の各要素を \r\n でつないで送り、同じ改行で分割して受け取る。
+    # 中では \n で扱い、返すときに元の改行へ戻す。
+    raw_source = source_text_from(user_message["content"])
+    eol = raw_source.include?("\r\n") ? "\r\n" : "\n"
+    source_text = raw_source.gsub("\r\n", "\n")
 
     begin
       translated, label = translate(source_text)
     rescue => e
       raise unless upstream_timeout_error?(e)
 
-      warn "upstream timeout after #{UPSTREAM_TIMEOUT}s: #{model_for_source_text(source_text)}"
+      warn "upstream timeout (base #{UPSTREAM_TIMEOUT}s): #{model_for_source_text(source_text)}"
       log_brief_translation(source_text, source_text, "timeout")
-      write_response(sock, 200, completion_response(source_text, "timeout", "length"))
+      write_response(sock, 200, completion_response(raw_source, "timeout", "length"))
       next
     end
 
     log_brief_translation(source_text, translated, label)
-    write_response(sock, 200, completion_response(translated, label))
+    write_response(sock, 200, completion_response(translated.gsub(/\r?\n/, eol), label))
   rescue UpstreamError => e
     warn "proxy error: #{e.message}"
     begin

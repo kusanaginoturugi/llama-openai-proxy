@@ -6,8 +6,19 @@
 - 最初の `role: user` メッセージの `content` を使い、**1 行目をクエリとして捨て、2 行目以降を原文**とみなす
 - それ以外のフィールド（`model`、`temperature` など）は無視する
 
-> 要確認: 上の前提は旧実装から引き継いだもの。`OpenAI_ArrayLimit=2` のとき 2 件がどう連結されるか
-> （改行区切りか、別メッセージか）は未検証。`--dump` で実リクエストを取って確認する。
+`--dump` で確認した実際のリクエスト（2026-09-30、xTranslator / `Embarcadero RESTClient/1.0`）:
+
+```json
+{"model": "<OpenAI_Model>",
+ "messages": [{"role": "user",
+               "content": "<OpenAI_Query（%lang_dest% は展開済み、%lang_src% は未展開のまま）>\r\n<要素1>\r\n<要素2>"}]}
+```
+
+- 改行は `\r\n`。`OpenAI_ArrayLimit=2` のときは 2 要素が `\r\n` でつながって 1 リクエストになる
+- system メッセージなし、`stream` なし。`Connection: Keep-Alive` を送ってくるが、`Connection: close` で返して問題ない
+- `OpenAI_CharLimit` を超える要素は xTranslator 側で捨てられ、送られてこない
+- プロキシは中では `\n` で扱い、応答は**受け取った改行コード（`\r\n`）に戻して**返す。行数は要素数と一致させる必要がある
+- 要素の中に改行がある場合、要素の区切りと区別できない。行数さえ保てば xTranslator 側で正しく戻る前提（要確認）
 
 ## 翻訳の流れ
 

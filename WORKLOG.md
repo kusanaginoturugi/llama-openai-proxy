@@ -27,10 +27,17 @@ Record:
 - `scripts/try.sh` と `scripts/samples.txt` を追加。
 - `README.md` を書き直し、`docs/spec.md` を新規作成。
 
+Record（xTranslator 実機確認）:
+
+- `commonApiPrefs.ini` は GUI から変えられず、xTranslator を閉じて編集した（`OpenAI_URL=http://127.0.0.1:8091/...`）。
+- `--dump` の結果: 配列の要素は `\r\n` 区切りで 1 リクエストにまとまる。応答を `\n` で返していたので、受け取った改行コードで返すようにした。
+- 「4 件中 2 件で止まる」: xTranslator が `OpenAI_CharLimit=1500` を超える文字列を送らずに捨てていた（警告が出る）。`Misc/ApiTranslator.txt` を 6000 に上げた（要 xTranslator 再起動）。改行コードの件が止まった原因にどこまで関わっていたかは未確定。
+- 長文向け: `max_tokens` の上限を 8192 にし、read timeout を `UPSTREAM_TIMEOUT + max_tokens/25` 秒に。約 3100 文字の本で 35 秒（再試行 1 回を含む）。
+- 用語照合と例文検索で `<img src=...>` などのタグの中を無視するようにした（`Books` → `本` の誤検出）。
+
 Handoff:
 
-- xTranslator の `OpenAI_URL` はまだ `:18080` のまま（作業中は xTranslator が起動していたので ini を触っていない）。GUI で `:8091` に変える。
-- 未検証: xTranslator の実リクエスト形式（特に `ArrayLimit=2` のときの連結方法）。`--dump` で採って `docs/spec.md` を更新する。
+- 未確認: `CharLimit=6000` にした後、長文を含めて xTranslator から通しで訳せるか。
 - 未検証: `prefs_vocab_*.ini` の `|1` が「無効」を意味するという前提（旧実装からの引き継ぎ）。
 - `~/.local/bin/llama-openai-proxy.rb` はリポジトリへの symlink にした（7/13 の古い版は置き換え済み）。
 - 今後の候補: 類似例文の選び方を embedding（`embeddinggemma-300M` が router にある）に置き換える。キャッシュのキーに辞書の版を含める。
