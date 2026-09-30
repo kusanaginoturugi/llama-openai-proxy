@@ -74,6 +74,7 @@ Dread Gargoyle	ドレッド・ガーゴイル
 - 応答後処理で、Markdown コードフェンス、箇条書き、番号、太字、引用符風の装飾、余計な `<tags>` を削る。
 - 1行入力に対して複数行出力が返った場合は、空行を捨てて1行へ結合する。
 - 原文行末に `.` / `。` がない場合、訳文行末に追加された `.` / `。` は削る。
+- llama.cpp が `XTRANSLATOR_UPSTREAM_TIMEOUT` 秒以内に返さない場合は、翻訳せず原文をそのまま返して次へ進ませる。
 - xTranslator が先に接続を閉じた場合の `EPIPE` / `ECONNRESET` は通常の切断として扱い、プロキシは落とさない。
 
 短文モデルの振り分けは環境変数で変えられる。
@@ -83,6 +84,7 @@ XTRANSLATOR_SHORT_MODEL=translategemma-4B
 XTRANSLATOR_LONG_MODEL=translategemma-12B
 XTRANSLATOR_SHORT_MODEL_MAX_LINES=2
 XTRANSLATOR_SHORT_MODEL_MAX_CHARS=160
+XTRANSLATOR_UPSTREAM_TIMEOUT=12
 ```
 
 ## xTranslator API settings

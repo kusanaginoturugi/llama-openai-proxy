@@ -16,6 +16,7 @@ SHORT_MODEL = ENV.fetch("XTRANSLATOR_SHORT_MODEL", "translategemma-4B")
 LONG_MODEL = ENV.fetch("XTRANSLATOR_LONG_MODEL", "translategemma-12B")
 SHORT_MODEL_MAX_LINES = ENV.fetch("XTRANSLATOR_SHORT_MODEL_MAX_LINES", "2").to_i
 SHORT_MODEL_MAX_CHARS = ENV.fetch("XTRANSLATOR_SHORT_MODEL_MAX_CHARS", "160").to_i
+UPSTREAM_TIMEOUT = ENV.fetch("XTRANSLATOR_UPSTREAM_TIMEOUT", "18").to_f
 
 def load_glossary
   paths = GLOSSARY_PREPEND.split(":") + [GLOSSARY_PATH]
@@ -83,6 +84,23 @@ def glossary_translation(glossary, line)
   nil
 end
 
+def completion_response(content, model, finish_reason = "stop")
+  JSON.dump(
+    choices: [
+      {
+        finish_reason: finish_reason,
+        index: 0,
+        message: {
+          role: "assistant",
+          content: content
+        }
+      }
+    ],
+    object: "chat.completion",
+    model: model
+  )
+end
+
 def direct_glossary_response(body)
   payload = JSON.parse(body)
   user_message = user_message_from(payload)
@@ -102,24 +120,13 @@ def direct_glossary_response(body)
   end
   return nil if translated.any?(&:nil?)
 
-  response = {
-    choices: [
-      {
-        finish_reason: "stop",
-        index: 0,
-        message: {
-          role: "assistant",
-          content: translated.join("\n")
-        }
-      }
-    ],
-    object: "chat.completion",
-    model: payload["model"] || "glossary"
-  }
-
-  JSON.dump(response)
+  completion_response(translated.join("\n"), payload["model"] || "glossary")
 rescue JSON::ParserError
   nil
+end
+
+def upstream_timeout_error?(error)
+  error.is_a?(Net::OpenTimeout) || error.is_a?(Net::ReadTimeout)
 end
 
 def inject_glossary(body)
@@ -347,11 +354,28 @@ loop do
 
     post.body = upstream_body
 
-    upstream = Net::HTTP.start(UPSTREAM.host, UPSTREAM.port) do |http|
-      http.request(post)
-    end
+    begin
+      upstream = Net::HTTP.start(UPSTREAM.host, UPSTREAM.port) do |http|
+        if UPSTREAM_TIMEOUT.positive?
+          http.open_timeout = UPSTREAM_TIMEOUT
+          http.read_timeout = UPSTREAM_TIMEOUT
+        end
 
-    response_body = sanitize_response_body(upstream.body.to_s, request_source_text)
+        http.request(post)
+      end
+
+      response_body = sanitize_response_body(upstream.body.to_s, request_source_text)
+    rescue => e
+      if upstream_timeout_error?(e)
+        warn "upstream timeout after #{UPSTREAM_TIMEOUT}s: #{selected_model}"
+        response_body = completion_response(request_source_text, "timeout:#{selected_model}", "length")
+        log_brief_translation(request_source_text, response_body, "timeout:#{selected_model}")
+        write_response(sock, 200, response_body)
+        next
+      end
+
+      raise
+    end
 
     log_verbose(
       "---- llama.cpp response #{upstream.code} ----",
