@@ -1,0 +1,16 @@
+[Unit]
+Description=xTranslator 用 llama.cpp 翻訳プロキシ (127.0.0.1:8091)
+After=llama.cpp.service
+Wants=llama.cpp.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/llama-openai-proxy
+# ログイン直後に VRAM を掴まないよう、モデルは最初のリクエストでロードする
+Environment=XTRANSLATOR_WARMUP=0
+ExecStart=/usr/bin/ruby %h/src/llama-openai-proxy/llama-openai-proxy.rb --brief
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

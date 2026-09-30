@@ -40,9 +40,11 @@ Record（xTranslator 実機確認）:
   - 再試行は `XTRANSLATOR_CLIENT_BUDGET`（18 秒）に収まりそうなときだけにした。
   - 問題が残った訳もキャッシュするようにした（temperature 0 なので再実行しても同じ）。切断された長文も、再翻訳で即座に返る。
   - 同じ日記（2702 文字）: 1 回目 16.5 秒（問題なし）、2 回目はキャッシュから 0 秒。
+- systemd user サービス `llama-openai-proxy.service` を作って有効化した（`After=llama.cpp.service`、`XTRANSLATOR_WARMUP=0`、`--brief`）。定義は `systemd/` にも置いた。
 
 Handoff:
 
+- プロキシは `systemctl --user` で常駐中。コードを変えたら `systemctl --user restart llama-openai-proxy`。ログは `journalctl --user -u llama-openai-proxy -f -o cat`。
 - 約 2700 文字を超える文は、1 回目は xTranslator の timeout に間に合わない。再翻訳すればキャッシュから返る。根本的に直すなら、応答を chunked で少しずつ送って接続を保つ方法がある（Delphi 側で効くかは未検証）。
 - 未検証: `prefs_vocab_*.ini` の `|1` が「無効」を意味するという前提（旧実装からの引き継ぎ）。
 - `~/.local/bin/llama-openai-proxy.rb` はリポジトリへの symlink にした（7/13 の古い版は置き換え済み）。

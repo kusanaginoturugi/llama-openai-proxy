@@ -18,6 +18,7 @@ xTranslator (wine) ──POST──▶ proxy 127.0.0.1:8091 ──▶ llama-serv
 | パス | 役割 |
 | --- | --- |
 | `llama-openai-proxy.rb` | プロキシ本体 |
+| `systemd/llama-openai-proxy.service` | user サービス定義（`~/.config/systemd/user/` にコピーして使う） |
 | `lib/sst.rb` | SST リーダ / 有効辞書の列挙 |
 | `lib/dictionary.rb` | 翻訳メモリ・用語照合・類似例文検索 |
 | `xtranslator-glossary.local.tsv` | 手動の上書き辞書（SST より優先） |
@@ -26,6 +27,23 @@ xTranslator (wine) ──POST──▶ proxy 127.0.0.1:8091 ──▶ llama-serv
 | `scripts/try.sh` / `scripts/samples.txt` | 動作確認用 |
 
 ## Start
+
+systemd の user サービスとして常駐させている（`systemd/llama-openai-proxy.service`）。
+
+```sh
+# 初回インストール
+cp systemd/llama-openai-proxy.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now llama-openai-proxy
+
+systemctl --user restart llama-openai-proxy   # コード変更後
+journalctl --user -u llama-openai-proxy -f -o cat   # 訳のログ（--brief 形式）
+```
+
+サービスでは `XTRANSLATOR_WARMUP=0` にしている（ログイン直後に VRAM を掴まないため）。
+モデルが載っていない状態での最初の 1 件は xTranslator の timeout を超えることがある。その場合はもう一度翻訳すればキャッシュから返る。
+
+手で起動する場合（サービスを止めてから）:
 
 ```sh
 ruby ~/src/llama-openai-proxy/llama-openai-proxy.rb --brief
@@ -97,7 +115,7 @@ scripts/try.sh 8091 < scripts/samples.txt
 
 ## Reload
 
-- プロキシのコードを変えたら: プロキシ再起動
+- プロキシのコードを変えたら: `systemctl --user restart llama-openai-proxy`
 - 辞書（SST / local TSV）を変えたら: 不要（自動再読込）
 - プロンプトや既定モデルを変えて過去訳を捨てたいとき: `rm ~/.cache/llama-openai-proxy/translations.jsonl`
 - `Misc/ApiTranslator.txt` を変えたら: xTranslator 再起動
