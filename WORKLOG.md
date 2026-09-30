@@ -32,7 +32,7 @@ Handoff:
 - xTranslator の `OpenAI_URL` はまだ `:18080` のまま（作業中は xTranslator が起動していたので ini を触っていない）。GUI で `:8091` に変える。
 - 未検証: xTranslator の実リクエスト形式（特に `ArrayLimit=2` のときの連結方法）。`--dump` で採って `docs/spec.md` を更新する。
 - 未検証: `prefs_vocab_*.ini` の `|1` が「無効」を意味するという前提（旧実装からの引き継ぎ）。
-- `~/.local/bin/llama-openai-proxy.rb` は 7/13 の古い版で、どのコミットとも一致しない。まだ残してある。
+- `~/.local/bin/llama-openai-proxy.rb` はリポジトリへの symlink にした（7/13 の古い版は置き換え済み）。
 - 今後の候補: 類似例文の選び方を embedding（`embeddinggemma-300M` が router にある）に置き換える。キャッシュのキーに辞書の版を含める。
 
 ## 2026-07-15 xTranslator proxy hardening
