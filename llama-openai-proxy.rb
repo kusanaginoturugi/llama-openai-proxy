@@ -238,9 +238,15 @@ def problems_in(output, source_text, terms)
     problems << "Translate \"#{t[:source]}\" as \"#{t[:target]}\"."
   end
 
-  letters = output.scan(/[A-Za-z]/).length
-  if Dictionary.words(source_text).length >= 3 && letters > output.gsub(/<[^<>]*>|\s/, "").length / 2
+  # タグ (<...>) と本のページ区切りなど ([pagebreak]) の中の英字は数えない
+  plain = output.gsub(/<[^<>]*>|\[[^\[\]]*\]/, "")
+  if Dictionary.words(Dictionary.mask_tags(source_text)).length >= 3 &&
+     plain.scan(/[A-Za-z]/).length > plain.gsub(/\s/, "").length / 2
     problems << "The text was not translated into Japanese."
+  else
+    # 訳文に混ざった小文字始まりのラテン文字の単語（"wielderに", "voluntadで"）。固有名詞は大文字なので対象外
+    leaked = plain.scan(/(?<![\p{Latin}\d%])\p{Ll}[\p{Latin}']{2,}(?![\p{Latin}])/).uniq
+    problems << "These words are not Japanese. Translate them: #{leaked.join(', ')}" unless leaked.empty?
   end
 
   problems

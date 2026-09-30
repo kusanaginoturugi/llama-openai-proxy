@@ -93,8 +93,8 @@ class Dictionary
   end
 
   # 原文中に出てくる用語を左から最長一致で拾う。
-  # 1 語の用語は、原文側で大文字始まりで、かつ 文中にある か 訳がカタカナを含む（固有名詞の音訳）ときだけ採用する。
-  # "Speak = 話す" のような文頭の一般語を拾わないため。
+  # 1 語の用語は、原文側で大文字始まり かつ 訳がカタカナを含む（固有名詞の音訳）ときだけ採用する。
+  # パーク名などのタイトルケース ("Stand Your Ground") で "Your = あなたの" を拾わないため。
   def match_terms(text, limit: 40)
     text = Dictionary.mask_tags(text).tr("’", "'")
     tokens = []
@@ -108,9 +108,11 @@ class Dictionary
       [@max_term_words, tokens.length - i].min.downto(1) do |n|
         entry = @terms[lowered[i, n].join(" ")]
         next unless entry
-        next if n == 1 && !entry[:local] && !proper_noun?(text, tokens[i], entry[:target])
+        next if n == 1 && !entry[:local] && !(tokens[i][0].match?(/\A[[:upper:]]/) && entry[:target].match?(/\p{Katakana}/))
         # 2 語目以降は大文字小文字まで一致したときだけ（"an Imperial sword" を "Imperial Sword" にしない）
         next if n > 1 && !entry[:local] && tokens[i + 1, n - 1].map(&:first) != entry[:words].drop(1)
+        # 全部小文字の句 ("pick up") は一般的な言い回しなので用語にしない
+        next if n > 1 && !entry[:local] && tokens[i, n].none? { |word, _| word.match?(/\A[[:upper:]]/) }
 
         hit = [entry, n]
         break
@@ -157,14 +159,6 @@ class Dictionary
   end
 
   private
-
-  def proper_noun?(text, (word, offset), target)
-    return false unless word.match?(/\A[[:upper:]]/)
-    return true if target.match?(/\p{Katakana}/)
-
-    before = text[0, offset].rstrip
-    !before.empty? && !before.match?(/[.!?:;"“]\z/)
-  end
 
   def build(paths)
     @memory = {}
@@ -243,7 +237,8 @@ class Dictionary
     first = !@memory.key?(source)
     @memory[source] ||= target
     @memory_ci[source.downcase] ||= target
-    add_term(source, target, local) if local || term_like?(source)
+    # 作業中辞書の 1 語の用語は使わない（"Dragonbone = ドラゴンボーン" のような誤訳を広めないため）
+    add_term(source, target, local) if local || (term_like?(source) && !(session && !source.include?(" ")))
     add_example(source, target, session) if first && example_like?(source, target)
   end
 
@@ -267,10 +262,12 @@ class Dictionary
     words.each { |word| (@postings[word] ||= []) << id }
   end
 
-  # 旧 xtranslator_sst_glossary.rb の usable_entry? と同じ基準。
+  # 旧 xtranslator_sst_glossary.rb の usable_entry? と同じ基準に加え、
+  # "(Laughing.)" や "No. " のような記号・空白付きのセリフ断片を除く。
   def term_like?(source)
     return false if source.length < TERM_MIN_CHARS || source.length > TERM_MAX_CHARS
-    return false if source.match?(/[\r\n<>]/)
+    return false if source != source.strip
+    return false if source.match?(/[\r\n<>()\[\]!?.;"“”…*]/)
     return false if source.count(" ") > 6
     return false if source.match?(/[.!?。！？]\z/)
     return false if source == source.downcase
