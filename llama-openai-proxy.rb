@@ -1,42 +1,48 @@
 #!/usr/bin/env ruby
+# frozen_string_literal: true
 
+require "fileutils"
 require "json"
 require "net/http"
 require "socket"
+require "time"
 require "uri"
+require_relative "lib/dictionary"
 
 BRIEF_LOG = !!(ARGV.delete("--brief") || ARGV.delete("-b"))
-LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 18080
-UPSTREAM = URI("http://127.0.0.1:8080/v1/chat/completions")
-GLOSSARY_PATH = ENV.fetch("XTRANSLATOR_GLOSSARY", "/tmp/xtranslator-glossary.tsv")
-GLOSSARY_PREPEND = ENV.fetch("XTRANSLATOR_GLOSSARY_PREPEND", "/home/onoue/src/llama-openai-proxy/xtranslator-glossary.local.tsv")
-GLOSSARY_LIMIT = ENV.fetch("XTRANSLATOR_GLOSSARY_LIMIT", "40").to_i
-SHORT_MODEL = ENV.fetch("XTRANSLATOR_SHORT_MODEL", "translategemma-4B")
-LONG_MODEL = ENV.fetch("XTRANSLATOR_LONG_MODEL", "translategemma-12B")
-SHORT_MODEL_MAX_LINES = ENV.fetch("XTRANSLATOR_SHORT_MODEL_MAX_LINES", "2").to_i
-SHORT_MODEL_MAX_CHARS = ENV.fetch("XTRANSLATOR_SHORT_MODEL_MAX_CHARS", "160").to_i
-UPSTREAM_TIMEOUT = ENV.fetch("XTRANSLATOR_UPSTREAM_TIMEOUT", "18").to_f
+DUMP_PATH = (i = ARGV.index("--dump")) ? ARGV.slice!(i, 2)[1] : ENV["XTRANSLATOR_DUMP"]
 
-def load_glossary
-  paths = GLOSSARY_PREPEND.split(":") + [GLOSSARY_PATH]
-  seen = {}
-  paths.flat_map do |path|
-    next [] unless File.file?(path)
+def env(key, default) = ENV.fetch("XTRANSLATOR_#{key}", default)
 
-    File.readlines(path, chomp: true).filter_map do |line|
-      line = line.strip
-      next if line.empty? || line.start_with?("#")
+LISTEN_HOST = env("LISTEN_HOST", "127.0.0.1")
+LISTEN_PORT = env("LISTEN_PORT", "8091").to_i
+UPSTREAM = URI(env("UPSTREAM", "http://127.0.0.1:8080/v1/chat/completions"))
+MODEL = env("MODEL", "gemma-4-12b-it-qat-imatrix")
+SHORT_MODEL = env("SHORT_MODEL", "")
+SHORT_MODEL_MAX_LINES = env("SHORT_MODEL_MAX_LINES", "2").to_i
+SHORT_MODEL_MAX_CHARS = env("SHORT_MODEL_MAX_CHARS", "160").to_i
+TEMPERATURE = env("TEMPERATURE", "0").to_f
+UPSTREAM_TIMEOUT = env("UPSTREAM_TIMEOUT", "30").to_f
+RETRIES = env("RETRIES", "1").to_i
+WARMUP = env("WARMUP", "1") != "0"
 
-      source, target = line.split("\t", 3)
-      next if source.to_s.empty? || target.to_s.empty?
-      next if seen[source.downcase]
+XT_ROOT = File.expand_path(env("ROOT", "~/.local/bin/_xTranslator"))
+GAME = env("GAME", "SkyrimSE")
+GAME_TITLE = env("GAME_TITLE", "The Elder Scrolls V: Skyrim")
+SOURCE_LANG = env("SOURCE_LANG", "english")
+DEST_LANG = env("DEST_LANG", "japanese")
+GLOSSARY_PREPEND = env("GLOSSARY_PREPEND", File.join(__dir__, "xtranslator-glossary.local.tsv"))
+GLOSSARY_LIMIT = env("GLOSSARY_LIMIT", "40").to_i
+EXAMPLE_LIMIT = env("EXAMPLE_LIMIT", "3").to_i
+CACHE_PATH = env("CACHE", File.expand_path("~/.cache/llama-openai-proxy/translations.jsonl"))
+PROMPT_VERSION = "2"
 
-      seen[source.downcase] = true
-      { source: source, target: target }
-    end
-  end
-end
+DICTIONARY = Dictionary.new(
+  root: XT_ROOT, game: GAME, source: SOURCE_LANG, dest: DEST_LANG,
+  local_paths: GLOSSARY_PREPEND.split(":").map { |path| File.expand_path(path) }
+)
+
+# ---- xTranslator request ----
 
 def source_text_from(content)
   content.to_s.split(/\r?\n/, 2)[1].to_s
@@ -49,39 +55,14 @@ def user_message_from(payload)
   messages.find { |m| m.is_a?(Hash) && m["role"] == "user" && m["content"].is_a?(String) }
 end
 
-def prefer_longest_entries(entries)
-  entries
-    .sort_by { |entry| [-entry[:source].length, entry[:source].downcase] }
-    .each_with_object([]) do |entry, selected|
-      source = entry[:source].downcase
-      next if selected.any? { |picked| picked[:source].downcase.include?(source) }
-
-      selected << entry
-    end
-end
-
 def model_for_source_text(source_text)
+  return MODEL if SHORT_MODEL.empty?
+
   lines = source_text.to_s.split(/\r?\n/, -1)
   compact_text = source_text.to_s.gsub(/\s+/, "")
+  return SHORT_MODEL if lines.length <= SHORT_MODEL_MAX_LINES && compact_text.length <= SHORT_MODEL_MAX_CHARS
 
-  if lines.length <= SHORT_MODEL_MAX_LINES && compact_text.length <= SHORT_MODEL_MAX_CHARS
-    SHORT_MODEL
-  else
-    LONG_MODEL
-  end
-end
-
-def glossary_translation(glossary, line)
-  direct = glossary[line.downcase]
-  return direct if direct
-
-  if line.start_with?("Spell Tome: ")
-    spell = line.delete_prefix("Spell Tome: ")
-    translated_spell = glossary[spell.downcase]
-    return "呪文の書: #{translated_spell}" if translated_spell
-  end
-
-  nil
+  MODEL
 end
 
 def completion_response(content, model, finish_reason = "stop")
@@ -101,68 +82,73 @@ def completion_response(content, model, finish_reason = "stop")
   )
 end
 
-def direct_glossary_response(body)
-  payload = JSON.parse(body)
-  user_message = user_message_from(payload)
-  return nil unless user_message
+# ---- cache ----
 
-  glossary = {}
-  load_glossary.each { |entry| glossary[entry[:source].downcase] ||= entry[:target] }
+# 検証を通った LLM 訳だけを JSONL に追記して再利用する。
+class TranslationCache
+  def initialize(path)
+    @path = path
+    @entries = {}
+    return if path.to_s.empty? || !File.file?(path)
 
-  source_text = source_text_from(user_message["content"])
-  lines = source_text.split(/\r?\n/, -1)
-  return nil if lines.empty?
-
-  translated = lines.map do |line|
-    next "" if line.empty?
-
-    glossary_translation(glossary, line)
+    File.foreach(path, chomp: true) do |line|
+      row = JSON.parse(line)
+      @entries[row["key"]] = row["text"]
+    rescue JSON::ParserError
+      next
+    end
   end
-  return nil if translated.any?(&:nil?)
 
-  completion_response(translated.join("\n"), payload["model"] || "glossary")
-rescue JSON::ParserError
-  nil
+  def key(model, text) = [PROMPT_VERSION, model, text].join("\t")
+
+  def [](model, text) = @entries[key(model, text)]
+
+  def store(model, text, translated)
+    return if @path.to_s.empty?
+
+    k = key(model, text)
+    @entries[k] = translated
+    FileUtils.mkdir_p(File.dirname(@path))
+    File.open(@path, "a") { |f| f.puts JSON.dump(key: k, text: translated) }
+  end
+
+  def size = @entries.size
 end
 
-def upstream_timeout_error?(error)
-  error.is_a?(Net::OpenTimeout) || error.is_a?(Net::ReadTimeout)
-end
+CACHE = TranslationCache.new(CACHE_PATH)
 
-def inject_glossary(body)
-  payload = JSON.parse(body)
-  user_message = user_message_from(payload)
-  return body unless user_message
+# ---- prompt ----
 
-  source_text = source_text_from(user_message["content"])
-  payload["model"] = model_for_source_text(source_text)
-  matched = prefer_longest_entries(
-    load_glossary.select { |entry| source_text.include?(entry[:source]) }
-  ).first(GLOSSARY_LIMIT)
-  glossary = matched.map { |entry| "#{entry[:source]}\t#{entry[:target]}" }.join("\n")
-  glossary_section = matched.empty? ? "" : "\nGlossary entries that must be used exactly:\n#{glossary}\n"
-
-  user_message["content"] = <<~PROMPT.chomp
-    Translate the source text from Skyrim into Japanese.
-    Output only the translated text.
-    Do not acknowledge the request.
-    Do not copy the source text unless it is an untranslatable proper noun.
-    Do not add labels such as "translation", "result", or "translated text".
-    Do not add explanations, notes, comments, filenames, quotes, Markdown, bullets, numbering, or code fences.
+def build_prompt(text, terms, examples, problems = [])
+  sections = []
+  sections << <<~RULES.chomp
+    You are a professional English (en) to Japanese (ja) translator for the video game #{GAME_TITLE}.
+    Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Japanese grammar, vocabulary, and the style of the official Japanese localization.
+    Produce only the Japanese translation, without any additional explanations or commentary.
     Keep exactly the same number of lines as the source text.
-    Preserve only angle-bracket placeholders that already exist in the source text, such as <dur>, <mag>, and <a_A>.
-    For titles, spell names, effect names, item names, and noun phrases, output a Japanese title or noun phrase, not a full sentence.
-    For spell names starting with "Conjure", prefer the Japanese form "<summoned name>召喚".
-    #{glossary_section}
-    Source text:
+    Keep angle-bracket placeholders such as <mag>, <dur> and <Alias=Player> exactly as they are.
+    For titles, spell names, effect names, item names, and noun phrases, output a Japanese noun phrase, not a full sentence.
+  RULES
 
-    #{source_text}
-  PROMPT
+  unless terms.empty?
+    sections << "Glossary. Always use these exact Japanese terms:\n" +
+                terms.map { |t| "#{t[:source]} = #{t[:target]}" }.join("\n")
+  end
 
-  JSON.dump(payload)
-rescue JSON::ParserError
-  body
+  unless examples.empty?
+    sections << "Reference translations from the official Japanese localization:\n" +
+                examples.map { |s, t| "English: #{s}\nJapanese: #{t}" }.join("\n\n")
+  end
+
+  unless problems.empty?
+    sections << "Your previous translation had these problems. Fix them:\n" + problems.map { |p| "- #{p}" }.join("\n")
+  end
+
+  sections << "Please translate the following English text into Japanese:\n\n\n#{text}"
+  sections.join("\n\n")
 end
+
+# ---- response cleanup (旧実装から継承) ----
 
 def strip_model_markup(text)
   text
@@ -176,11 +162,12 @@ def strip_model_markup(text)
     .gsub(/\*\*([^*\r\n]+)\*\*/, "\\1")
     .gsub(/__([^_\r\n]+)__/, "\\1")
     .gsub(/`([^`\r\n]+)`/, "\\1")
+    .sub(/\A\s*(?:Japanese|日本語|翻訳|訳文)\s*[:：]\s*/, "")
     .sub(/\r?\n+\z/, "")
 end
 
 def angle_tags(text)
-  text.to_s.scan(/<[^<>\r\n]+>/).uniq
+  text.to_s.scan(/<[^<>\r\n]+>/)
 end
 
 def strip_unseen_angle_tags(text, source_text)
@@ -189,12 +176,12 @@ def strip_unseen_angle_tags(text, source_text)
 
   if source_lines.length == output_lines.length
     return output_lines.each_with_index.map do |line, index|
-      allowed = angle_tags(source_lines[index])
+      allowed = angle_tags(source_lines[index]).uniq
       line.gsub(/<[^<>\r\n]+>/) { |tag| allowed.include?(tag) ? tag : "" }
     end.join("\n")
   end
 
-  allowed = angle_tags(source_text)
+  allowed = angle_tags(source_text).uniq
   text.gsub(/<[^<>\r\n]+>/) { |tag| allowed.include?(tag) ? tag : "" }
 end
 
@@ -223,25 +210,141 @@ def strip_added_terminal_periods(text, source_text)
   end.join("\n")
 end
 
-def sanitize_response_body(body, source_text)
-  payload = JSON.parse(body)
-  choices = payload["choices"]
-  return body unless choices.is_a?(Array)
+def sanitize(content, source_text)
+  content = strip_model_markup(content.to_s)
+  content = strip_unseen_angle_tags(content, source_text)
+  content = enforce_source_line_count(content, source_text)
+  strip_added_terminal_periods(content, source_text)
+end
 
-  choices.each do |choice|
-    message = choice["message"]
-    next unless message.is_a?(Hash) && message["content"].is_a?(String)
+# ---- validation ----
 
-    content = strip_model_markup(message["content"])
-    content = strip_unseen_angle_tags(content, source_text)
-    content = enforce_source_line_count(content, source_text)
-    message["content"] = strip_added_terminal_periods(content, source_text)
+def normalize_ja(text) = text.to_s.gsub(/[\s・=＝]/, "")
+
+def problems_in(output, source_text, terms)
+  problems = []
+  source_lines = source_text.split(/\r?\n/, -1).length
+  output_lines = output.split(/\r?\n/, -1).length
+  problems << "The source has #{source_lines} lines but the translation has #{output_lines} lines." if source_lines != output_lines
+
+  missing_tags = angle_tags(source_text).tally.select { |tag, n| output.scan(tag).length < n }.keys
+  problems << "Keep these placeholders: #{missing_tags.join(' ')}" unless missing_tags.empty?
+
+  terms.each do |t|
+    next if normalize_ja(output).include?(normalize_ja(t[:target]))
+
+    problems << "Translate \"#{t[:source]}\" as \"#{t[:target]}\"."
   end
 
-  JSON.dump(payload)
-rescue JSON::ParserError
-  body
+  letters = output.scan(/[A-Za-z]/).length
+  if Dictionary.words(source_text).length >= 3 && letters > output.gsub(/<[^<>]*>|\s/, "").length / 2
+    problems << "The text was not translated into Japanese."
+  end
+
+  problems
 end
+
+# ---- upstream ----
+
+class UpstreamError < StandardError
+  attr_reader :status, :body
+
+  def initialize(status, body)
+    @status = status
+    @body = body
+    super("upstream #{status}: #{body.to_s[0, 200]}")
+  end
+end
+
+def upstream_chat(model, prompt, max_tokens)
+  post = Net::HTTP::Post.new(UPSTREAM)
+  post["Content-Type"] = "application/json"
+  post["Accept"] = "application/json"
+  post.body = JSON.dump(
+    model: model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: TEMPERATURE,
+    max_tokens: max_tokens,
+    stream: false
+  )
+
+  Net::HTTP.start(UPSTREAM.host, UPSTREAM.port) do |http|
+    if UPSTREAM_TIMEOUT.positive?
+      http.open_timeout = UPSTREAM_TIMEOUT
+      http.read_timeout = UPSTREAM_TIMEOUT
+    end
+
+    http.request(post)
+  end
+end
+
+# LLM で訳す。問題があれば指摘付きで再試行し、問題の少ない方を採る。
+# 戻り値: [訳文, 残った問題]
+def translate_with_llm(model, text)
+  terms = DICTIONARY.match_terms(text, limit: GLOSSARY_LIMIT)
+  examples = DICTIONARY.similar_examples(text, limit: EXAMPLE_LIMIT)
+  max_tokens = (text.length * 3).clamp(64, 4096)
+  best = nil
+  problems = []
+
+  (RETRIES + 1).times do |attempt|
+    prompt = build_prompt(text, terms, examples, problems)
+    log_verbose("---- upstream prompt #{model} (attempt #{attempt + 1}) ----", prompt)
+
+    response = upstream_chat(model, prompt, max_tokens)
+    raise UpstreamError.new(response.code.to_i, response.body) unless response.code.to_i == 200
+
+    content = JSON.parse(response.body).dig("choices", 0, "message", "content").to_s
+    output = sanitize(content, text)
+    problems = problems_in(output, text, terms)
+    log_verbose("---- llama.cpp output (attempt #{attempt + 1}) ----", content, "problems: #{problems.inspect}")
+
+    best = [output, problems] if best.nil? || problems.length < best[1].length
+    break if problems.empty?
+  end
+
+  best
+end
+
+# 1 リクエスト分を訳す。戻り値: [訳文, ログ用ラベル]
+def translate(source_text)
+  DICTIONARY.refresh!
+
+  whole = DICTIONARY.lookup(source_text)
+  return [whole, "glossary"] if whole
+
+  lines = source_text.split(/\r?\n/, -1)
+  resolved = lines.map { |line| line.strip.empty? ? line : DICTIONARY.lookup(line) }
+  pending = lines.each_index.reject { |i| resolved[i] }
+  return [resolved.join("\n"), "glossary"] if pending.empty?
+
+  model = model_for_source_text(source_text)
+  partial = pending.length < lines.count { |line| !line.strip.empty? }
+  text = partial ? pending.map { |i| lines[i] }.join("\n") : source_text
+
+  if (cached = CACHE[model, text])
+    output = cached
+    label = "cache"
+  else
+    output, problems = translate_with_llm(model, text)
+    CACHE.store(model, text, output) if problems.empty?
+    label = problems.empty? ? model : "#{model} (#{problems.length} problems)"
+  end
+
+  return [output, label] unless partial
+
+  translated = output.split(/\r?\n/, -1)
+  if translated.length == pending.length
+    pending.each_with_index { |line_index, i| resolved[line_index] = translated[i] }
+    return [resolved.join("\n"), "glossary+#{label}"]
+  end
+
+  # 行数が合わなければ部分合成を諦めて全文を訳す
+  output, = translate_with_llm(model, source_text)
+  [output, model]
+end
+
+# ---- HTTP ----
 
 def read_request(sock)
   head = +""
@@ -260,7 +363,7 @@ def read_request(sock)
   body = rest.to_s
   body << sock.read(length - body.bytesize) while body.bytesize < length
 
-  [request_line, headers, body]
+  [request_line, headers, body.force_encoding(Encoding::UTF_8)]
 end
 
 def write_response(sock, status, body)
@@ -278,23 +381,16 @@ def client_disconnected?(error)
   error.is_a?(Errno::EPIPE) || error.is_a?(Errno::ECONNRESET) || error.is_a?(IOError)
 end
 
+def upstream_timeout_error?(error)
+  error.is_a?(Net::OpenTimeout) || error.is_a?(Net::ReadTimeout)
+end
+
+# ---- logging ----
+
 def log_verbose(*lines)
   return if BRIEF_LOG
 
   lines.each { |line| warn line }
-end
-
-def response_text_from(body)
-  payload = JSON.parse(body)
-  choices = payload["choices"]
-  return nil unless choices.is_a?(Array)
-
-  message = choices.dig(0, "message")
-  return nil unless message.is_a?(Hash)
-
-  message["content"]
-rescue JSON::ParserError
-  nil
 end
 
 def brief_style(text, code)
@@ -303,19 +399,41 @@ def brief_style(text, code)
   "\e[#{code}m#{text}\e[0m"
 end
 
-def log_brief_translation(source_text, response_body, model)
+def log_brief_translation(source_text, translated, model)
   return unless BRIEF_LOG
 
   warn brief_style("モデル: #{model}", "1;35")
   warn brief_style("ソース", "1;32")
   warn source_text
   warn brief_style("訳文", "1;36")
-  warn(response_text_from(response_body) || response_body)
+  warn translated
   warn brief_style("────────────────", "2")
+end
+
+def dump_request(request_line, headers, body)
+  return if DUMP_PATH.to_s.empty?
+
+  File.open(DUMP_PATH, "a") do |f|
+    f.puts JSON.dump(time: Time.now.iso8601, request_line: request_line, headers: headers, body: body)
+  end
+end
+
+# ---- main ----
+
+if WARMUP
+  Thread.new do
+    upstream_chat(MODEL, "Translate into Japanese: Hello", 4)
+    warn "warmup: #{MODEL} loaded"
+  rescue => e
+    warn "warmup failed: #{e.class}: #{e.message}"
+  end
 end
 
 server = TCPServer.new(LISTEN_HOST, LISTEN_PORT)
 warn "listening on http://#{LISTEN_HOST}:#{LISTEN_PORT}/v1/chat/completions"
+warn "upstream #{UPSTREAM} model=#{MODEL}#{SHORT_MODEL.empty? ? '' : " short=#{SHORT_MODEL}"}"
+warn "dictionary memory=#{DICTIONARY.memory_size} terms=#{DICTIONARY.term_size} examples=#{DICTIONARY.example_size} cache=#{CACHE.size}"
+warn "dump requests to #{DUMP_PATH}" unless DUMP_PATH.to_s.empty?
 
 trap("INT") do
   warn "\nbye"
@@ -327,65 +445,34 @@ loop do
 
   begin
     request_line, headers, body = read_request(sock)
-    request_payload = JSON.parse(body)
-    request_source_text = source_text_from(user_message_from(request_payload)&.fetch("content", ""))
+    dump_request(request_line, headers, body)
+    log_verbose("---- xTranslator request ----", request_line, headers.inspect, body)
 
-    log_verbose(
-      "---- xTranslator request ----",
-      request_line,
-      headers.inspect,
-      body
-    )
+    user_message = user_message_from(JSON.parse(body))
+    raise "no user message in request" unless user_message
 
-    if (direct_body = direct_glossary_response(body))
-      log_verbose("---- direct glossary response ----", direct_body)
-      log_brief_translation(request_source_text, direct_body, "glossary")
-      write_response(sock, 200, direct_body)
+    source_text = source_text_from(user_message["content"])
+
+    begin
+      translated, label = translate(source_text)
+    rescue => e
+      raise unless upstream_timeout_error?(e)
+
+      warn "upstream timeout after #{UPSTREAM_TIMEOUT}s: #{model_for_source_text(source_text)}"
+      log_brief_translation(source_text, source_text, "timeout")
+      write_response(sock, 200, completion_response(source_text, "timeout", "length"))
       next
     end
 
-    selected_model = model_for_source_text(request_source_text)
-    post = Net::HTTP::Post.new(UPSTREAM)
-    post["Content-Type"] = "application/json"
-    post["Accept"] = "application/json"
-    post["Authorization"] = headers["authorization"] || "Bearer no-key"
-    upstream_body = inject_glossary(body)
-    log_verbose("---- upstream request #{selected_model} ----", upstream_body)
-
-    post.body = upstream_body
-
+    log_brief_translation(source_text, translated, label)
+    write_response(sock, 200, completion_response(translated, label))
+  rescue UpstreamError => e
+    warn "proxy error: #{e.message}"
     begin
-      upstream = Net::HTTP.start(UPSTREAM.host, UPSTREAM.port) do |http|
-        if UPSTREAM_TIMEOUT.positive?
-          http.open_timeout = UPSTREAM_TIMEOUT
-          http.read_timeout = UPSTREAM_TIMEOUT
-        end
-
-        http.request(post)
-      end
-
-      response_body = sanitize_response_body(upstream.body.to_s, request_source_text)
-    rescue => e
-      if upstream_timeout_error?(e)
-        warn "upstream timeout after #{UPSTREAM_TIMEOUT}s: #{selected_model}"
-        response_body = completion_response(request_source_text, "timeout:#{selected_model}", "length")
-        log_brief_translation(request_source_text, response_body, "timeout:#{selected_model}")
-        write_response(sock, 200, response_body)
-        next
-      end
-
-      raise
+      write_response(sock, e.status, e.body.to_s)
+    rescue => write_error
+      raise write_error unless client_disconnected?(write_error)
     end
-
-    log_verbose(
-      "---- llama.cpp response #{upstream.code} ----",
-      upstream.body.to_s,
-      "---- sanitized response ----",
-      response_body
-    )
-    log_brief_translation(request_source_text, response_body, selected_model)
-
-    write_response(sock, upstream.code.to_i, response_body)
   rescue => e
     if client_disconnected?(e)
       warn "client disconnected: #{e.class}: #{e.message}"

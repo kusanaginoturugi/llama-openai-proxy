@@ -1,0 +1,11 @@
+Jarl Balgruuf the Greater wants you to deliver this Iron Sword to Whiterun.
+The Greybeards have summoned you to High Hrothgar. Speak with Arngeir.
+Targets take <mag> points of frost damage per second for <dur> seconds.
+Bring the Dragonstone from Bleak Falls Barrow to Farengar in Dragonsreach.
+<Alias=Player>, the Companions of Jorrvaskr would welcome a warrior like you.
+Shadowmere's Saddle
+Conjure Dread Gargoyle
+Iron Sword
+Spell Tome: Flames
+You never should have come here, Dragonborn. The Thalmor will not be pleased.
+Increases your One-handed skill by 15%.

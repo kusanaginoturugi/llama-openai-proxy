@@ -1,153 +1,88 @@
-# xTranslator local llama.cpp translation setup
+# llama-openai-proxy
 
-このフォルダの xTranslator は、OpenAI API 枠を llama.cpp の OpenAI 互換 API に向けて使う。
+xTranslator の OpenAI API 枠を llama.cpp（router モード）に向けるための Ruby プロキシ。
+xTranslator の辞書（`UserDictionaries/*.sst`）を直接読み、辞書で確定できる訳は辞書から返し、
+残りは用語集と公式訳の類似例文をプロンプトに添えて LLM に訳させる。
+
+```
+xTranslator (wine) ──POST──▶ proxy 127.0.0.1:8091 ──▶ llama-server router 127.0.0.1:8080
+                               ├ SST 辞書: 完全一致 / 用語 / 類似例文
+                               ├ 検証 → 指摘付き再試行
+                               └ キャッシュ ~/.cache/llama-openai-proxy/translations.jsonl
+```
+
+仕様の詳細は [`docs/spec.md`](docs/spec.md)、作業履歴と引き継ぎは [`WORKLOG.md`](WORKLOG.md)。
 
 ## Files
 
-- `~/.local/bin/llama-openai-proxy.rb`
-  - xTranslator と llama.cpp の間に挟む Ruby プロキシ。
-  - Wine/Delphi REST と llama.cpp の応答相性を避ける。
-  - 辞書 TSV をプロンプトに注入する。
-  - 辞書に完全一致した行は llama.cpp に投げず、そのまま辞書訳を返す。
+| パス | 役割 |
+| --- | --- |
+| `llama-openai-proxy.rb` | プロキシ本体 |
+| `lib/sst.rb` | SST リーダ / 有効辞書の列挙 |
+| `lib/dictionary.rb` | 翻訳メモリ・用語照合・類似例文検索 |
+| `xtranslator-glossary.local.tsv` | 手動の上書き辞書（SST より優先） |
+| `xtranslator_sst_glossary.rb` | SST から用語 TSV を書き出す補助ツール（プロキシには不要） |
+| `xtranslator` | xTranslator を日本語ロケールで起動する wine ラッパ |
+| `scripts/try.sh` / `scripts/samples.txt` | 動作確認用 |
 
-- `~/.local/bin/_xTranslator/xtranslator_sst_glossary.rb`
-  - xTranslator の `UserDictionaries/*.sst` から TSV 辞書を生成する。
-
-- `/tmp/xtranslator-glossary.tsv`
-  - 自動生成の辞書。再起動で消えてよい。
-
-- `~/.local/bin/_xTranslator/xtranslator-glossary.local.tsv`
-  - 手動上書き辞書。自動生成より優先される。
-
-## Start proxy
+## Start
 
 ```sh
-ruby ~/.local/bin/llama-openai-proxy.rb
+ruby ~/src/llama-openai-proxy/llama-openai-proxy.rb --brief
 ```
 
-ログを原文と訳文だけに絞る:
+- `--brief` / `-b`: 原文・訳文・どこで訳したか（`glossary` / `cache` / モデル名）だけ表示
+- `--dump PATH`: xTranslator からの生リクエストを JSONL で追記（仕様確認用）
 
-```sh
-ruby ~/.local/bin/llama-openai-proxy.rb --brief
-ruby ~/.local/bin/llama-openai-proxy.rb -b
-```
+起動時にモデルを warmup でロードする。初回だけ数十秒かかる。
 
-TTY では `モデル`、`ソース`、`訳文` に色が付く。
+## xTranslator settings
 
-## Generate glossary
-
-SkyrimSE english -> japanese:
-
-```sh
-ruby ~/.local/bin/_xTranslator/xtranslator_sst_glossary.rb \
-  --game SkyrimSE \
-  --source english \
-  --dest japanese \
-  -o /tmp/xtranslator-glossary.tsv
-```
-
-xTranslator で辞書を保存したあと、これを再実行すると反映される。
-プロキシはリクエストごとに TSV を読み直すので、プロキシ再起動は不要。
-
-## Manual glossary override
-
-`~/.local/bin/_xTranslator/xtranslator-glossary.local.tsv` に TSV で書く。
+OpenAI API タブ（または `UserPrefs/commonApiPrefs.ini`。xTranslator 終了中に編集）:
 
 ```txt
-Conjure Dread Gargoyle	ドレッド・ガーゴイル召喚
-Dread Gargoyle	ドレッド・ガーゴイル
-```
-
-完全一致した行は LLM に投げず、この訳を直接返す。
-
-## Proxy behavior
-
-プロキシは xTranslator から来た本文をそのまま llama.cpp に流さない。
-
-- xTranslator の `OpenAI_Query` 部分は翻訳対象から外し、原文だけを `Source text` として渡す。
-- 用語集に完全一致した行は llama.cpp に投げず、辞書訳を直接返す。
-- 複数行リクエストでは、全行が辞書で解決できた場合だけ直接返す。1行でも未解決ならリクエスト全体を llama.cpp に回す。
-- `Spell Tome: <辞書にある呪文名>` は例外的に `呪文の書: <呪文名の訳>` として直接返す。
-- 2行以下かつ空白抜き160文字以下の短文は `translategemma-4B`、それ以外は `translategemma-12B` に自動で振り分ける。
-- llama.cpp に回す場合も、用語集ヒットの有無に関係なく、プロキシ側で英語の出力制約プロンプトを注入する。
-- 用語集ヒットがある場合は、最大 `XTRANSLATOR_GLOSSARY_LIMIT` 件までプロンプトに TSV 形式で添付する。
-- 応答後処理で、Markdown コードフェンス、箇条書き、番号、太字、引用符風の装飾、余計な `<tags>` を削る。
-- 1行入力に対して複数行出力が返った場合は、空行を捨てて1行へ結合する。
-- 原文行末に `.` / `。` がない場合、訳文行末に追加された `.` / `。` は削る。
-- llama.cpp が `XTRANSLATOR_UPSTREAM_TIMEOUT` 秒以内に返さない場合は、翻訳せず原文をそのまま返して次へ進ませる。
-- xTranslator が先に接続を閉じた場合の `EPIPE` / `ECONNRESET` は通常の切断として扱い、プロキシは落とさない。
-
-短文モデルの振り分けは環境変数で変えられる。
-
-```sh
-XTRANSLATOR_SHORT_MODEL=translategemma-4B
-XTRANSLATOR_LONG_MODEL=translategemma-12B
-XTRANSLATOR_SHORT_MODEL_MAX_LINES=2
-XTRANSLATOR_SHORT_MODEL_MAX_CHARS=160
-XTRANSLATOR_UPSTREAM_TIMEOUT=12
-```
-
-## xTranslator API settings
-
-OpenAI API tab:
-
-```txt
+OpenAI_URL=http://127.0.0.1:8091/v1/chat/completions
 OpenAI_Key=no-key
-OpenAI_URL=http://127.0.0.1:18080/v1/chat/completions
-OpenAI_Model=translategemma-12B
-OpenAI_Query=Translate to %lang_dest%. Output only the translated text:
 ```
 
-Quality-first array settings are in `Misc/ApiTranslator.txt`, not `UserPrefs/commonApiPrefs.ini`.
+`OpenAI_Model` と `OpenAI_Query` はプロキシが差し替えるので何でもいい。
+ただしプロキシは「user メッセージの 1 行目 = クエリ、2 行目以降 = 原文」として扱うので、`OpenAI_Query` は 1 行にする。
 
-```txt
-OpenAI_CharLimit=2000
-OpenAI_ArrayLimit=2
-OpenAI_ArrayTimePause=0
-```
+## Dictionary
 
-After changing `Misc/ApiTranslator.txt`, restart xTranslator.
+- `~/.local/bin/_xTranslator/UserDictionaries/SkyrimSE/*_english_japanese.sst` を全部読む
+- `UserPrefs/SkyrimSE/prefs_vocab_english_japanese.ini` で `name|1` の辞書は除外、並び順が優先順
+- xTranslator で辞書を保存すると、次のリクエストで自動的に読み直す（プロキシ再起動不要）
+- 手動で直したい訳は `xtranslator-glossary.local.tsv` に `原文<TAB>訳文` で書く
 
-## xTranslator launcher
-
-Use this wrapper instead of typing Wine locale vars every time:
+## Try
 
 ```sh
-xtranslator &
+scripts/try.sh 8091 < scripts/samples.txt
 ```
 
-Wrapper:
+## Environment
 
-```sh
-~/.local/bin/xtranslator
-```
+| 変数 | 既定値 | |
+| --- | --- | --- |
+| `XTRANSLATOR_LISTEN_PORT` | `8091` | |
+| `XTRANSLATOR_UPSTREAM` | `http://127.0.0.1:8080/v1/chat/completions` | |
+| `XTRANSLATOR_MODEL` | `gemma-4-12b-it-qat-imatrix` | router の model ID（`/etc/llama.cpp/models.ini` のセクション名） |
+| `XTRANSLATOR_SHORT_MODEL` | 空 | 設定すると短文だけこのモデルへ。`--models-max 1` だと載せ替えが頻発するので非推奨 |
+| `XTRANSLATOR_TEMPERATURE` | `0` | |
+| `XTRANSLATOR_UPSTREAM_TIMEOUT` | `30` | 秒。超えたら原文をそのまま返す |
+| `XTRANSLATOR_RETRIES` | `1` | 検証 NG 時の再試行回数 |
+| `XTRANSLATOR_GLOSSARY_LIMIT` | `40` | プロンプトに入れる用語の上限 |
+| `XTRANSLATOR_EXAMPLE_LIMIT` | `3` | プロンプトに入れる類似例文の数（0 で無効） |
+| `XTRANSLATOR_CACHE` | `~/.cache/llama-openai-proxy/translations.jsonl` | 空文字で無効 |
+| `XTRANSLATOR_WARMUP` | `1` | `0` で起動時ロードしない |
+| `XTRANSLATOR_ROOT` / `GAME` / `SOURCE_LANG` / `DEST_LANG` | `~/.local/bin/_xTranslator` / `SkyrimSE` / `english` / `japanese` | |
+| `XTRANSLATOR_GLOSSARY_PREPEND` | リポジトリ内 `xtranslator-glossary.local.tsv` | `:` 区切りで複数可 |
 
-It sets:
+## Reload
 
-```sh
-LANG=ja_JP.UTF-8
-LC_CTYPE=ja_JP.UTF-8
-```
-
-## llama.cpp notes
-
-`/etc/conf.d/llama.cpp` should not force these globally:
-
-```txt
---ctx-size 0
---n-gpu-layers all
-```
-
-Set model-specific values in `/etc/llama.cpp/models.ini`.
-
-Example:
-
-```ini
-[translategemma-12B]
-model = /home/onoue/.local/lib/llama.cpp/models/translategemma-12b-it.i1-Q4_K_M.gguf
-ctx-size = 1024
-parallel = 1
-n-gpu-layers = 30
-```
-
-If 12B fails with CUDA OOM, lower `n-gpu-layers` first.
+- プロキシのコードを変えたら: プロキシ再起動
+- 辞書（SST / local TSV）を変えたら: 不要（自動再読込）
+- プロンプトや既定モデルを変えて過去訳を捨てたいとき: `rm ~/.cache/llama-openai-proxy/translations.jsonl`
+- `Misc/ApiTranslator.txt` を変えたら: xTranslator 再起動
+- `/etc/llama.cpp/models.ini` を変えたら: llama.cpp 再起動
