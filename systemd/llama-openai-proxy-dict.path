@@ -1,0 +1,9 @@
+[Unit]
+Description=xTranslator の辞書 (SST) の変更を監視する
+
+[Path]
+PathChanged=%h/.local/bin/_xTranslator/UserDictionaries/SkyrimSE
+PathChanged=%h/.local/bin/_xTranslator/UserPrefs/SkyrimSE/prefs_vocab_english_japanese.ini
+
+[Install]
+WantedBy=default.target

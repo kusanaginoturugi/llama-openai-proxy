@@ -1,5 +1,24 @@
 # Work Log
 
+## 2026-09-30 辞書をスナップショット方式に変更
+
+Plan:
+
+- プロキシが SST を直接読むのをやめ、書き出したスナップショットを読む形に分ける。
+- SST の更新をスナップショットに自動で反映する。
+
+Record:
+
+- `xtranslator_sst_glossary.rb` に `--format jsonl` を追加した。全件を優先順・原文ごとに先勝ちで、一時ファイル経由で書き出す。既定の出力先は `~/.local/share/llama-openai-proxy/dictionary.jsonl`（7.8 万件、21MB、約 1 秒）。
+- `lib/dictionary.rb` はスナップショットと local TSV だけを読むようにした（読み込み 1.3 秒）。SST への依存は書き出しツール側だけ。
+- プロキシの `XTRANSLATOR_ROOT` / `GAME` / `SOURCE_LANG` / `DEST_LANG` をやめて、`XTRANSLATOR_DICTIONARY` にした。
+- `llama-openai-proxy-dict.path` を追加した。`PathChanged` で SST のディレクトリと `prefs_vocab` ini を監視し、変更があれば `.service` が 2 秒待ってから書き出す。プロキシのユニットは起動前に 1 回書き出す（`Wants=`）。
+- 事前の実験で、`PathChanged` がディレクトリ内の既存ファイルの上書き・追記でも発火することを確認した。テスト用ファイルの作成と削除では、書き出しは 1 回だけ走った。
+
+Handoff:
+
+- 未確認: xTranslator で実際に辞書を保存したときに、path unit が発火するか（保存方式が上書きか置き換えかは未確認。どちらでも `PathChanged` で拾える想定）。確認するには `journalctl --user -u llama-openai-proxy-dict -f`。
+
 ## 2026-09-30 llama.cpp router 対応と精度向上
 
 Plan:

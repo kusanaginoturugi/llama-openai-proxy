@@ -1,0 +1,9 @@
+[Unit]
+Description=xTranslator の SST から翻訳プロキシ用の辞書スナップショットを書き出す
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/src/llama-openai-proxy
+# xTranslator の保存が終わるのを少し待つ
+ExecStartPre=/usr/bin/sleep 2
+ExecStart=/usr/bin/ruby %h/src/llama-openai-proxy/xtranslator_sst_glossary.rb --format jsonl

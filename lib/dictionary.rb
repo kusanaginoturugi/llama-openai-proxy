@@ -1,9 +1,10 @@
 # frozen_string_literal: true
 
+require "json"
 require "set"
-require_relative "sst"
 
-# SST 辞書と手動 TSV から、翻訳メモリ・用語集・類似例文を引く。
+# 辞書スナップショット (JSONL) と手動 TSV から、翻訳メモリ・用語集・類似例文を引く。
+# スナップショットは xtranslator_sst_glossary.rb --format jsonl が SST から書き出す。
 # 元ファイルの mtime が変わったら refresh! で作り直す。
 class Dictionary
   WORD_RE = /[[:alnum:]]+(?:['’][[:alnum:]]+)*/
@@ -21,11 +22,8 @@ class Dictionary
 
   attr_reader :memory_size, :term_size, :example_size
 
-  def initialize(root:, game:, source:, dest:, local_paths: [])
-    @root = root
-    @game = game
-    @source = source
-    @dest = dest
+  def initialize(snapshot:, local_paths: [])
+    @snapshot = snapshot
     @local_paths = local_paths
     @signature = nil
     refresh!
@@ -40,9 +38,9 @@ class Dictionary
   # <img src=...> や <font ...> の中身を照合対象から外す（位置は保つ）。
   def self.mask_tags(text) = text.to_s.gsub(/<[^<>]*>/) { |tag| " " * tag.length }
 
+  # 手動 TSV が先（優先）、スナップショットが後
   def paths
-    @local_paths.select { |path| File.file?(path) } +
-      SST.files(root: @root, game: @game, source: @source, dest: @dest)
+    (@local_paths + [@snapshot]).select { |path| File.file?(path) }
   end
 
   # 元ファイルに変化があれば読み直す。読み直したら true。
@@ -50,6 +48,7 @@ class Dictionary
     signature = paths.map { |path| [path, File.mtime(path).to_f, File.size(path)] }
     return false if signature == @signature
 
+    warn "dictionary: snapshot not found: #{@snapshot}" unless File.file?(@snapshot)
     build(signature.map(&:first))
     @signature = signature
     true
@@ -149,7 +148,7 @@ class Dictionary
     @postings = Hash.new { |h, k| h[k] = [] }
 
     paths.each do |path|
-      local = !path.end_with?(".sst")
+      local = path != @snapshot
       each_pair(path) { |source, target| add(source, target, local) }
     rescue => e
       warn "dictionary: skip #{path}: #{e.message}"
@@ -162,8 +161,14 @@ class Dictionary
     @example_size = @examples.size
   end
 
-  def each_pair(path, &block)
-    return SST.each_pair(path, &block) if path.end_with?(".sst")
+  def each_pair(path)
+    if path == @snapshot
+      File.foreach(path, chomp: true, encoding: "utf-8") do |line|
+        row = JSON.parse(line)
+        yield row["source"].to_s, row["target"].to_s
+      end
+      return
+    end
 
     File.readlines(path, chomp: true, encoding: "bom|utf-8").each do |line|
       next if line.strip.empty? || line.start_with?("#")

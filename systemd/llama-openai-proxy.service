@@ -1,7 +1,7 @@
 [Unit]
 Description=xTranslator 用 llama.cpp 翻訳プロキシ (127.0.0.1:8091)
-After=llama.cpp.service
-Wants=llama.cpp.service
+After=llama.cpp.service llama-openai-proxy-dict.service
+Wants=llama.cpp.service llama-openai-proxy-dict.service
 
 [Service]
 Type=simple
